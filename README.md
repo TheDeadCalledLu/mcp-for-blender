@@ -11,6 +11,11 @@
 
 Prompt-assisted 3D modeling, scene creation, and manipulation — driven by AI.
 
+> **This fork** adds an embedded MCP server (Streamable HTTP, port 9877), async
+> tasks with polling, a `render_scene` tool, a fail-open busy guard and tool
+> annotations. See [README.zh-CN.md](README.zh-CN.md) for a Chinese summary of
+> the additions (中文说明见 [README.zh-CN.md](README.zh-CN.md)).
+
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/blender-mcp?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/blender-mcp)
 [![PyPI Version](https://img.shields.io/pypi/v/mcp-for-blender?color=blue)](https://pypi.org/project/mcp-for-blender/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
