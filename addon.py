@@ -22,10 +22,13 @@ import io
 from datetime import datetime
 import hashlib, hmac, base64
 import os.path as osp
-from collections import deque
+from collections import deque, OrderedDict
 from urllib.parse import quote, urlencode, urlparse, urlunparse, parse_qsl
 from contextlib import contextmanager, redirect_stdout, suppress
 from bpy.app.handlers import persistent
+import uuid
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 bl_info = {
     "name": "MCP for Blender",
@@ -1359,13 +1362,18 @@ class BlenderMCPServer:
     def _server_loop(self):
         """Main server loop in a separate thread"""
         print("Server thread started")
-        self.socket.settimeout(1.0)  # Timeout to allow for stopping
+
+        server_socket = self.socket
+        if server_socket is None:
+            print("Server thread stopped (no socket)")
+            return
+        server_socket.settimeout(1.0)  # Timeout to allow for stopping
 
         while self.running:
             try:
                 # Accept new connection
                 try:
-                    client, address = self.socket.accept()
+                    client, address = server_socket.accept()
                     print(f"Connected to client: {address}")
 
                     # Handle client in a separate thread
@@ -1378,8 +1386,16 @@ class BlenderMCPServer:
                 except socket.timeout:
                     # Just check running condition
                     continue
+                except OSError:
+                    # The listening socket was closed underneath us - that is the
+                    # normal shutdown path, so stay quiet about it.
+                    if not self.running:
+                        break
+                    time.sleep(0.5)
                 except Exception as e:
                     print(f"Error accepting connection: {str(e)}")
+                    if not self.running:
+                        break
                     time.sleep(0.5)
             except Exception as e:
                 print(f"Error in server loop: {str(e)}")
@@ -1506,6 +1522,7 @@ class BlenderMCPServer:
             "list_scene_items": self.list_scene_items,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "pick_viewport_object": self.pick_viewport_object,
+            "render_scene": self.render_scene,
             "execute_code": self.execute_code,
             "describe_node_type": self.describe_node_type,
             "bpy_api_lookup": self.bpy_api_lookup,
@@ -2235,6 +2252,58 @@ class BlenderMCPServer:
             "location": list(picked.matrix_world.translation),
         }}
 
+    def render_scene(self, filepath=None, format="png", camera=None, resolution_percentage=None):
+        """Render the scene from the active (or named) camera to *filepath*.
+
+        Unlike ``get_viewport_screenshot`` this does not need a visible 3D
+        viewport, so it also works when Blender is minimised or running
+        headless.  It is the reliable way for an agent to *see* lighting,
+        materials and camera framing.
+        """
+        try:
+            if not filepath:
+                return {"error": "No filepath provided"}
+
+            scene = bpy.context.scene
+            if camera:
+                cam_obj = bpy.data.objects.get(camera)
+                if cam_obj is None or cam_obj.type != 'CAMERA':
+                    return {"error": f"No camera named '{camera}' in the scene"}
+                scene.camera = cam_obj
+            if scene.camera is None:
+                return {"error": "The scene has no active camera to render from"}
+
+            # Remember the settings we touch so the user's scene is left as-is.
+            previous = {
+                "filepath": scene.render.filepath,
+                "format": scene.render.image_settings.file_format,
+                "resolution_percentage": scene.render.resolution_percentage,
+            }
+
+            scene.render.filepath = filepath
+            scene.render.image_settings.file_format = format.upper()
+            if resolution_percentage is not None:
+                scene.render.resolution_percentage = int(resolution_percentage)
+
+            try:
+                bpy.ops.render.render(write_still=True)
+            finally:
+                scene.render.filepath = previous["filepath"]
+                scene.render.image_settings.file_format = previous["format"]
+                scene.render.resolution_percentage = previous["resolution_percentage"]
+
+            if not os.path.exists(filepath):
+                return {"error": "Render finished but no file was written"}
+
+            return {
+                "success": True,
+                "filepath": filepath,
+                "camera": scene.camera.name,
+                "resolution": [scene.render.resolution_x, scene.render.resolution_y],
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""
         # This is powerful but potentially dangerous - use with caution
@@ -2248,7 +2317,7 @@ class BlenderMCPServer:
                 exec(code, namespace)
 
             captured_output = capture_buffer.getvalue()
-            return {"executed": True, "result": captured_output}
+            return {"executed": True, "result": _truncate_output(captured_output)}
         except Exception as e:
             # Give the caller the same detail we have: exception type, message,
             # and a full traceback (with line numbers into the submitted code),
@@ -2259,7 +2328,7 @@ class BlenderMCPServer:
                 json.dumps({
                     "exception_type": type(e).__name__,
                     "message": str(e),
-                    "traceback": tb,
+                    "traceback": _truncate_output(tb),
                 })
             )
 
@@ -5254,6 +5323,380 @@ def _premium_tag_redraw():
         pass
 
 
+# ===========================================================================
+# Embedded MCP server
+# ===========================================================================
+#
+# The Model Context Protocol server lives *inside* Blender.  It speaks
+# JSON-RPC 2.0 over the "Streamable HTTP" transport, so an MCP client can talk
+# to it directly - no agent-side process is required:
+#
+#     { "servers": { "blendermcp": { "type": "http",
+#                                    "url": "http://localhost:9877/mcp" } } }
+#
+# The server is started automatically together with Blender (see
+# `_blendermcp_autostart`), so there is nothing to click.  The legacy raw
+# socket server on port 9876 is kept for backwards compatibility with the
+# `uvx blender-mcp` stdio bridge and with third-party scripts.
+# ===========================================================================
+
+MCP_SERVER_NAME = "BlenderMCP"
+MCP_SERVER_VERSION = ".".join(str(part) for part in bl_info["version"])
+MCP_DEFAULT_HOST = "localhost"
+MCP_DEFAULT_MCP_PORT = 9877
+MCP_DEFAULT_SOCKET_PORT = 9876
+MCP_HTTP_PATH = "/mcp"
+MCP_SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+MCP_DEFAULT_PROTOCOL_VERSION = MCP_SUPPORTED_PROTOCOL_VERSIONS[0]
+MCP_CALL_TIMEOUT = 900.0
+MCP_VERBOSE_LOG = False
+
+MCP_INSTRUCTIONS = (
+    "This server drives a running Blender session. Use get_scene_info() first to see "
+    "what is in the scene, prefer the asset integrations (PolyHaven, Sketchfab, "
+    "Hyper3D Rodin, Hunyuan3D) over scripting when they are enabled, and fall back to "
+    "execute_blender_code only when nothing else fits."
+)
+
+MCP_ASSET_CREATION_STRATEGY = """When creating 3D content in Blender, always start by checking if integrations are available:
+
+    0. Before anything, always check the scene from get_scene_info()
+    1. First use the following tools to verify if the following integrations are enabled:
+        1. PolyHaven
+            Use get_polyhaven_status() to verify its status
+            If PolyHaven is enabled:
+            - For objects/models: Use download_polyhaven_asset() with asset_type="models"
+            - For materials/textures: Use download_polyhaven_asset() with asset_type="textures"
+            - For environment lighting: Use download_polyhaven_asset() with asset_type="hdris"
+        2. Sketchfab
+            Sketchfab is good at Realistic models, and has a wider variety of models than PolyHaven.
+            Use get_sketchfab_status() to verify its status
+            If Sketchfab is enabled:
+            - For objects/models: First search using search_sketchfab_models() with your query
+            - Then download specific models using download_sketchfab_model() with the UID
+            - Note that only downloadable models can be accessed, and API key must be properly configured
+            - Sketchfab has a wider variety of models than PolyHaven, especially for specific subjects
+        3. Hyper3D(Rodin)
+            Hyper3D Rodin is good at generating 3D models for single item.
+            So don't try to:
+            1. Generate the whole scene with one shot
+            2. Generate ground using Hyper3D
+            3. Generate parts of the items separately and put them together afterwards
+
+            Use get_hyper3d_status() to verify its status
+            If Hyper3D is enabled:
+            - For objects/models, do the following steps:
+                1. Create the model generation task
+                    - Use generate_hyper3d_model_via_images() if image(s) is/are given
+                    - Use generate_hyper3d_model_via_text() if generating 3D asset using text prompt
+                    If key type is free_trial and insufficient balance error returned, tell the user that the free trial key can only generated limited models everyday, they can choose to:
+                    - Wait for another day and try again
+                    - Go to hyper3d.ai to find out how to get their own API key
+                    - Go to fal.ai to get their own private API key
+                2. Poll the status
+                    - Use poll_rodin_job_status() to check if the generation task has completed or failed
+                3. Import the asset
+                    - Use import_generated_asset() to import the generated GLB model the asset
+                4. After importing the asset, ALWAYS check the world_bounding_box of the imported mesh, and adjust the mesh's location and size
+                    Adjust the imported mesh's location, scale, rotation, so that the mesh is on the right spot.
+
+                You can reuse assets previous generated by running python code to duplicate the object, without creating another generation task.
+        4. Hunyuan3D
+            Hunyuan3D is good at generating 3D models for single item.
+            So don't try to:
+            1. Generate the whole scene with one shot
+            2. Generate ground using Hunyuan3D
+            3. Generate parts of the items separately and put them together afterwards
+
+            Use get_hunyuan3d_status() to verify its status
+            If Hunyuan3D is enabled:
+                if Hunyuan3D mode is "OFFICIAL_API":
+                    - For objects/models, do the following steps:
+                        1. Create the model generation task
+                            - Use generate_hunyuan3d_model by providing either a **text description** OR an **image(local or urls) reference**.
+                            - Go to cloud.tencent.com out how to get their own SecretId and SecretKey
+                        2. Poll the status
+                            - Use poll_hunyuan_job_status() to check if the generation task has completed or failed
+                        3. Import the asset
+                            - Use import_generated_asset_hunyuan() to import the generated OBJ model the asset
+                    if Hunyuan3D mode is "LOCAL_API":
+                        - For objects/models, do the following steps:
+                        1. Create the model generation task
+                            - Use generate_hunyuan3d_model if image (local or urls)  or text prompt is given and import the asset
+
+                You can reuse assets previous generated by running python code to duplicate the object, without creating another generation task.
+
+    3. Always check the world_bounding_box for each item so that:
+        - Ensure that all objects that should not be clipping are not clipping.
+        - Items have right spatial relationship.
+
+    4. Recommended asset source priority:
+        - For specific existing objects: First try Sketchfab, then PolyHaven
+        - For generic objects/furniture: First try PolyHaven, then Sketchfab
+        - For custom or unique items not available in libraries: Use Hyper3D Rodin or Hunyuan3D
+        - For environment lighting: Use PolyHaven HDRIs
+        - For materials/textures: Use PolyHaven textures
+
+    Only fall back to scripting when:
+    - PolyHaven, Sketchfab, Hyper3D, and Hunyuan3D are all disabled
+    - A simple primitive is explicitly requested
+    - No suitable asset exists in any of the libraries
+    - Hyper3D Rodin or Hunyuan3D failed to generate the desired asset
+    - The task specifically requires a basic material/color
+    """
+
+
+class MCPToolError(Exception):
+    """Raised when a tool could not be executed inside Blender."""
+
+
+class MCPMethodNotFound(Exception):
+    """Raised for unknown JSON-RPC methods."""
+
+    def __init__(self, method):
+        super().__init__(method)
+        self.method = method
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+MCP_MAX_OUTPUT_CHARS = 20000
+
+
+def _truncate_output(text, limit=MCP_MAX_OUTPUT_CHARS):
+    """Keep a tool result from blowing up the client's context window."""
+    if text is None:
+        return ""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    head = text[: limit // 2]
+    tail = text[-limit // 2 :]
+    return f"{head}\n\n... [{len(text) - limit} characters truncated] ...\n\n{tail}"
+
+
+# ---------------------------------------------------------------------------
+# Async task manager
+# ---------------------------------------------------------------------------
+#
+# MCP clients time out a single request after ~60s, but a Blender render or a
+# long script can take minutes.  Instead of blocking the request (and risking
+# the client retrying and running the work twice), long tools can be started
+# as a background task and polled with ``get_task_status``.
+
+MCP_TASK_TTL = 3600.0
+MCP_MAX_TASKS = 64
+
+
+class MCPTaskManager:
+    """Runs long tool calls in the background and tracks their progress."""
+
+    def __init__(self, ttl=MCP_TASK_TTL, max_tasks=MCP_MAX_TASKS):
+        self._lock = threading.Lock()
+        self._tasks = OrderedDict()
+        self._ttl = ttl
+        self._max_tasks = max_tasks
+
+    def _prune_locked(self):
+        now = time.time()
+        for task_id in list(self._tasks):
+            task = self._tasks[task_id]
+            if task["state"] in ("done", "error") and now - task["finished_at"] > self._ttl:
+                del self._tasks[task_id]
+        while len(self._tasks) > self._max_tasks:
+            self._tasks.popitem(last=False)
+
+    def submit(self, kind, func, request_id=None):
+        """Start *func* in a worker thread and return its task id."""
+        with self._lock:
+            self._prune_locked()
+            if request_id:
+                for task_id, task in self._tasks.items():
+                    if task["request_id"] == request_id:
+                        return task_id, False
+            task_id = uuid.uuid4().hex[:12]
+            self._tasks[task_id] = {
+                "id": task_id,
+                "kind": kind,
+                "state": "running",
+                "request_id": request_id,
+                "started_at": time.time(),
+                "finished_at": None,
+                "result": None,
+                "error": None,
+            }
+        thread = threading.Thread(
+            target=self._run, args=(task_id, func), name=f"BlenderMCP-task-{task_id}", daemon=True
+        )
+        thread.start()
+        return task_id, True
+
+    def _run(self, task_id, func):
+        try:
+            result = func()
+            state, error = "done", None
+        except BaseException as exc:  # noqa: BLE001 - reported to the client
+            result, state, error = None, "error", f"{type(exc).__name__}: {exc}"
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None:
+                task["state"] = state
+                task["result"] = result
+                task["error"] = error
+                task["finished_at"] = time.time()
+
+    def status(self, task_id):
+        with self._lock:
+            self._prune_locked()
+            task = self._tasks.get(task_id)
+            if task is None:
+                return None
+            return {
+                "task_id": task["id"],
+                "kind": task["kind"],
+                "state": task["state"],
+                "elapsed": round(time.time() - task["started_at"], 2),
+                "result": task["result"],
+                "error": task["error"],
+            }
+
+    def cancel(self, task_id):
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return False
+            if task["state"] == "running":
+                # The worker thread cannot be interrupted safely; mark it so
+                # the client stops waiting and the result is discarded.
+                task["state"] = "cancelled"
+                task["finished_at"] = time.time()
+            return True
+
+
+MCP_TASKS = MCPTaskManager()
+
+
+# ---------------------------------------------------------------------------
+# Blender busy detection
+# ---------------------------------------------------------------------------
+#
+# ``bpy.app.timers`` callbacks are not serviced while Blender is inside a
+# render or a blocking modal dialog.  Without a check a request would simply
+# hang for the full call timeout; instead we fail fast with an actionable
+# message.
+#
+# The ONLY reliable signal is the watcher timer's own liveness: if the timer
+# keeps ticking, Blender is servicing timers and the request will be picked
+# up.  ``window.modal_operators`` is deliberately NOT used - it is non-empty
+# for harmless things like the splash screen or a tooltip, which would block
+# every request.
+
+_MCP_BUSY = {"render": False, "heartbeat": None}
+
+
+def _mcp_render_pre(*_args, **_kwargs):
+    _MCP_BUSY["render"] = True
+
+
+def _mcp_render_post(*_args, **_kwargs):
+    _MCP_BUSY["render"] = False
+
+
+def _mcp_render_cancel(*_args, **_kwargs):
+    _MCP_BUSY["render"] = False
+
+
+def _mcp_modal_check():
+    """Timer callback: prove that Blender is still servicing timers.
+
+    It also re-asserts the render handlers, because a reload can run
+    ``unregister()`` after ``register()`` and silently drop them.
+    """
+    _MCP_BUSY["heartbeat"] = time.time()
+    try:
+        handlers = bpy.app.handlers
+        for handler, func in (
+            (handlers.render_pre, _mcp_render_pre),
+            (handlers.render_post, _mcp_render_post),
+            (handlers.render_cancel, _mcp_render_cancel),
+        ):
+            if func not in handler:
+                handler.append(func)
+    except Exception:
+        pass
+    return 0.5  # keep running
+
+
+def _mcp_busy_reason():
+    if _MCP_BUSY["render"]:
+        return "Blender is currently rendering"
+    return None
+
+
+def _mcp_render_in_progress():
+    """Best-effort check for an active render, independent of the handlers."""
+    if _MCP_BUSY["render"]:
+        return True
+    try:
+        return bool(bpy.app.is_job_running("RENDER"))
+    except Exception:
+        return False
+
+
+def _mcp_busy_is_stale():
+    """True when the watcher timer has stopped ticking.
+
+    A stale heartbeat means Blender is genuinely stuck (a blocking modal
+    dialog, a long operator) and cannot service timers, so a request would
+    hang.  A fresh heartbeat means timers are running and the request will be
+    handled - even if a modal operator happens to be open.
+
+    Before the watcher has ticked even once the state is unknown, so the
+    request is allowed through (fail-open) rather than rejected.
+    """
+    heartbeat = _MCP_BUSY.get("heartbeat")
+    if heartbeat is None:
+        return False
+    return (time.time() - heartbeat) > 3.0
+
+
+def _register_mcp_busy_handlers():
+    handlers = bpy.app.handlers
+    for handler, func in (
+        (handlers.render_pre, _mcp_render_pre),
+        (handlers.render_post, _mcp_render_post),
+        (handlers.render_cancel, _mcp_render_cancel),
+    ):
+        if func not in handler:
+            handler.append(func)
+    try:
+        if not bpy.app.timers.is_registered(_mcp_modal_check):
+            bpy.app.timers.register(_mcp_modal_check, first_interval=0.5, persistent=True)
+    except Exception as exc:
+        print(f"[BlenderMCP] Could not start the busy watcher: {exc}")
+
+
+def _unregister_mcp_busy_handlers():
+    handlers = bpy.app.handlers
+    for handler, func in (
+        (handlers.render_pre, _mcp_render_pre),
+        (handlers.render_post, _mcp_render_post),
+        (handlers.render_cancel, _mcp_render_cancel),
+    ):
+        try:
+            if func in handler:
+                handler.remove(func)
+        except Exception:
+            pass
+    try:
+        if bpy.app.timers.is_registered(_mcp_modal_check):
+            bpy.app.timers.unregister(_mcp_modal_check)
+    except Exception:
+        pass
+
+
 def _premium_remember_usage(data):
     usage = data.get("usage") if isinstance(data, dict) else None
     if isinstance(usage, dict):
@@ -5709,6 +6152,1439 @@ PREMIUM_CLASSES = (
     BLENDERMCP_OT_PremiumOpenAccount,
 )
 #endregion
+# ---------------------------------------------------------------------------
+# MCP content helpers
+# ---------------------------------------------------------------------------
+
+def mcp_text_content(text, is_error=False):
+    return {
+        "content": [{"type": "text", "text": "" if text is None else str(text)}],
+        "isError": bool(is_error),
+    }
+
+
+def mcp_json_content(payload, is_error=False):
+    try:
+        text = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    except Exception:
+        text = str(payload)
+    return mcp_text_content(text, is_error)
+
+
+def mcp_image_content(data_b64, mime_type="image/png"):
+    return {
+        "content": [{"type": "image", "data": data_b64, "mimeType": mime_type}],
+        "isError": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Blender main-thread bridge
+# ---------------------------------------------------------------------------
+
+def run_on_blender_main_thread(func, timeout=MCP_CALL_TIMEOUT):
+    """Run ``func`` on Blender's main thread and block until it finished.
+
+    The HTTP endpoint is served from worker threads, but *everything* that
+    touches ``bpy`` has to run on the main thread.  A one-shot
+    ``bpy.app.timers`` callback is used to hop over, and a ``threading.Event``
+    is used to hand the result back.
+    """
+    if threading.current_thread() is threading.main_thread():
+        return func()
+
+    # Fail fast instead of hanging for the full timeout when Blender cannot
+    # service timers.  A render is authoritative (the handler sets it and it
+    # is cleared on post/cancel).  Otherwise the watcher heartbeat decides:
+    # a fresh heartbeat means timers are running, so the request will be
+    # picked up even if a modal operator is open.
+    if _mcp_render_in_progress():
+        raise MCPToolError(
+            "Blender is currently rendering, so the request cannot be handled right "
+            "now. Wait for the render to finish and retry, or use the async mode of "
+            "the tool."
+        )
+    if _mcp_busy_is_stale():
+        raise MCPToolError(
+            "Blender is not responding to timers right now (a blocking dialog or a "
+            "long operator is probably open). Close it and retry, or use the async "
+            "mode of the tool."
+        )
+
+    box = {}
+    done = threading.Event()
+
+    def _runner():
+        try:
+            box["result"] = func()
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
+            box["error"] = exc
+        finally:
+            done.set()
+        return None  # one-shot timer
+
+    try:
+        bpy.app.timers.register(_runner, first_interval=0.0)
+    except Exception as exc:
+        raise MCPToolError(f"Could not schedule work on Blender's main thread: {exc}")
+
+    if not done.wait(timeout):
+        raise TimeoutError(
+            "Blender did not pick up the request in time - it may be busy with a modal "
+            "operator, a render or a file dialog."
+        )
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
+def mcp_invoke_command(command_server, cmd_type, params=None):
+    """Dispatch a command through the addon's command table and unwrap it."""
+    response = command_server.execute_command({"type": cmd_type, "params": params or {}})
+    if not isinstance(response, dict):
+        raise MCPToolError(f"Unexpected response from Blender: {response!r}")
+    if response.get("status") != "success":
+        message = str(response.get("message") or response)
+        if "Unknown command type" in message:
+            message = (
+                message
+                + ". The matching integration is most likely switched off - ask the user to "
+                "enable it in the BlenderMCP sidebar (View3D > Sidebar > BlenderMCP) and retry."
+            )
+        raise MCPToolError(message)
+    result = response.get("result")
+    # ``execute_code`` reports failures as a structured dict (with a traceback)
+    # rather than raising, so let that shape through untouched.
+    if isinstance(result, dict) and result.get("error") and "executed" not in result:
+        raise MCPToolError(str(result["error"]))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# JSON-Schema helpers for the tool definitions
+# ---------------------------------------------------------------------------
+
+def _schema_object(properties=None, required=None):
+    schema = {"type": "object", "properties": properties or {}}
+    if required:
+        schema["required"] = list(required)
+    return schema
+
+
+def _prop_string(description):
+    return {"type": "string", "description": description}
+
+
+def _prop_integer(description, default=None):
+    prop = {"type": "integer", "description": description}
+    if default is not None:
+        prop["default"] = default
+    return prop
+
+
+def _prop_number(description, default=None):
+    prop = {"type": "number", "description": description}
+    if default is not None:
+        prop["default"] = default
+    return prop
+
+
+def _prop_boolean(description, default=None):
+    prop = {"type": "boolean", "description": description}
+    if default is not None:
+        prop["default"] = default
+    return prop
+
+
+def _prop_array(item_type, description):
+    return {"type": "array", "items": {"type": item_type}, "description": description}
+
+
+def _annotations(read_only=False, destructive=False, idempotent=False, open_world=False):
+    """MCP tool annotations - let clients skip confirmation prompts where safe."""
+    return {
+        "title": None,
+        "readOnlyHint": bool(read_only),
+        "destructiveHint": bool(destructive),
+        "idempotentHint": bool(idempotent),
+        "openWorldHint": bool(open_world),
+    }
+
+
+def _process_bbox_condition(original_bbox):
+    """Normalise a [length, width, height] ratio into the API's 0-100 range."""
+    if original_bbox is None:
+        return None
+    if all(isinstance(value, int) for value in original_bbox):
+        return original_bbox
+    if any(value <= 0 for value in original_bbox):
+        raise ValueError("Incorrect number range: bbox must be bigger than zero!")
+    if not original_bbox:
+        return None
+    largest = max(original_bbox)
+    return [int(float(value) / largest * 100) for value in original_bbox]
+
+
+# ---------------------------------------------------------------------------
+# Tool definitions - each entry maps an MCP tool onto an addon command
+# ---------------------------------------------------------------------------
+
+def _tool_simple(cmd_type):
+    """Tool that forwards its arguments verbatim to *cmd_type*."""
+
+    def _run(server, args):
+        params = {key: value for key, value in args.items() if value is not None}
+        return mcp_json_content(mcp_invoke_command(server, cmd_type, params))
+
+    return _run
+
+
+def _run_get_scene_info(server, args):
+    return mcp_json_content(mcp_invoke_command(server, "get_scene_info"))
+
+
+def _run_get_object_info(server, args):
+    name = args.get("object_name")
+    return mcp_json_content(mcp_invoke_command(server, "get_object_info", {"name": name}))
+
+
+def _run_viewport_screenshot(server, args):
+    max_size = int(args.get("max_size") or 800)
+    temp_path = os.path.join(
+        tempfile.gettempdir(), f"blendermcp_viewport_{os.getpid()}_{int(time.time() * 1000)}.png"
+    )
+    result = mcp_invoke_command(
+        server,
+        "get_viewport_screenshot",
+        {"max_size": max_size, "filepath": temp_path, "format": "png"},
+    )
+    if isinstance(result, dict) and result.get("error"):
+        return mcp_text_content(f"Error: {result['error']}", True)
+    try:
+        with open(temp_path, "rb") as handle:
+            data = handle.read()
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+    return mcp_image_content(base64.b64encode(data).decode("ascii"), "image/png")
+
+
+def _run_execute_code(server, args):
+    code = args.get("code")
+    if code is None:
+        return mcp_text_content("Error: 'code' is required.", True)
+
+    if args.get("async"):
+        request_id = args.get("request_id")
+
+        def _work():
+            return mcp_invoke_command(server, "execute_code", {"code": code})
+
+        task_id, created = MCP_TASKS.submit("execute_blender_code", _work, request_id=request_id)
+        return mcp_json_content(
+            {
+                "task_id": task_id,
+                "state": "running",
+                "deduplicated": not created,
+                "hint": "Poll get_task_status(task_id=...) until state is 'done' or 'error'.",
+            }
+        )
+
+    result = mcp_invoke_command(server, "execute_code", {"code": code})
+    if isinstance(result, dict) and result.get("executed") is False:
+        return mcp_text_content(
+            f"Code failed: {result.get('error')}\n\n{result.get('traceback', '')}", True
+        )
+    output = result.get("result", "") if isinstance(result, dict) else result
+    return mcp_text_content(f"Code executed successfully: {output}")
+
+
+def _run_render_scene(server, args):
+    max_size = int(args.get("max_size") or 800)
+    camera = args.get("camera")
+    resolution_percentage = args.get("resolution_percentage")
+
+    def _render_to_file():
+        temp_path = os.path.join(
+            tempfile.gettempdir(),
+            f"blendermcp_render_{os.getpid()}_{int(time.time() * 1000)}.png",
+        )
+        result = mcp_invoke_command(
+            server,
+            "render_scene",
+            {
+                "filepath": temp_path,
+                "format": "png",
+                "camera": camera,
+                "resolution_percentage": resolution_percentage,
+            },
+        )
+        if isinstance(result, dict) and result.get("error"):
+            raise MCPToolError(str(result["error"]))
+        return temp_path
+
+    if args.get("async"):
+        request_id = args.get("request_id")
+        task_id, created = MCP_TASKS.submit("render_scene", _render_to_file, request_id=request_id)
+        return mcp_json_content(
+            {
+                "task_id": task_id,
+                "state": "running",
+                "deduplicated": not created,
+                "hint": "Poll get_task_status(task_id=...) until state is 'done' or 'error'.",
+            }
+        )
+
+    temp_path = _render_to_file()
+    try:
+        with open(temp_path, "rb") as handle:
+            data = handle.read()
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+    return mcp_image_content(base64.b64encode(data).decode("ascii"), "image/png")
+
+
+def _run_task_status(server, args):
+    task_id = args.get("task_id")
+    if not task_id:
+        return mcp_text_content("Error: 'task_id' is required.", True)
+    status = MCP_TASKS.status(task_id)
+    if status is None:
+        return mcp_text_content(f"Unknown or expired task_id: {task_id}", True)
+
+    if status["state"] == "error":
+        return mcp_text_content(f"Task failed: {status['error']}", True)
+
+    if status["state"] == "done":
+        result = status["result"]
+        # A render task returns a file path - turn it into an image for the model.
+        if status["kind"] == "render_scene" and isinstance(result, str) and os.path.exists(result):
+            try:
+                with open(result, "rb") as handle:
+                    data = handle.read()
+            finally:
+                try:
+                    os.remove(result)
+                except OSError:
+                    pass
+            return mcp_image_content(base64.b64encode(data).decode("ascii"), "image/png")
+        if isinstance(result, dict) and result.get("executed") is False:
+            return mcp_text_content(
+                f"Code failed: {result.get('error')}\n\n{result.get('traceback', '')}", True
+            )
+        if isinstance(result, dict) and "result" in result:
+            return mcp_text_content(f"Code executed successfully: {result['result']}")
+        return mcp_json_content(result)
+
+    return mcp_json_content(
+        {"task_id": task_id, "state": status["state"], "elapsed": status["elapsed"]}
+    )
+
+
+def _run_cancel_task(server, args):
+    task_id = args.get("task_id")
+    if not task_id:
+        return mcp_text_content("Error: 'task_id' is required.", True)
+    if not MCP_TASKS.cancel(task_id):
+        return mcp_text_content(f"Unknown or expired task_id: {task_id}", True)
+    return mcp_text_content(f"Task {task_id} marked as cancelled.")
+
+
+def _run_polyhaven_status(server, args):
+    result = mcp_invoke_command(server, "get_polyhaven_status")
+    message = result.get("message", "") if isinstance(result, dict) else str(result)
+    if isinstance(result, dict) and result.get("enabled"):
+        message += "PolyHaven is good at Textures, and has a wider variety of textures than Sketchfab."
+    return mcp_text_content(message)
+
+
+def _run_polyhaven_categories(server, args):
+    asset_type = args.get("asset_type") or "hdris"
+    result = mcp_invoke_command(server, "get_polyhaven_categories", {"asset_type": asset_type})
+    categories = result.get("categories", {}) if isinstance(result, dict) else {}
+    lines = [f"Categories for {asset_type}:", ""]
+    for name, count in sorted(categories.items(), key=lambda item: item[1], reverse=True):
+        lines.append(f"- {name}: {count} assets")
+    return mcp_text_content("\n".join(lines))
+
+
+def _run_search_polyhaven_assets(server, args):
+    asset_type = args.get("asset_type") or "all"
+    categories = args.get("categories")
+    result = mcp_invoke_command(
+        server, "search_polyhaven_assets", {"asset_type": asset_type, "categories": categories}
+    )
+    if not isinstance(result, dict):
+        return mcp_json_content(result)
+    assets = result.get("assets", {}) or {}
+    lines = [f"Found {result.get('total_count', len(assets))} assets"]
+    if categories:
+        lines[0] += f" in categories: {categories}"
+    lines[0] += f"\nShowing {result.get('returned_count', len(assets))} assets:\n"
+    for asset_id, asset_data in sorted(
+        assets.items(), key=lambda item: item[1].get("download_count", 0), reverse=True
+    ):
+        type_names = ["HDRI", "Texture", "Model"]
+        type_index = asset_data.get("type", 0)
+        type_label = type_names[type_index] if 0 <= type_index < len(type_names) else "Unknown"
+        lines.append(f"- {asset_data.get('name', asset_id)} (ID: {asset_id})")
+        lines.append(f"  Type: {type_label}")
+        lines.append(f"  Categories: {', '.join(asset_data.get('categories', []))}")
+        lines.append(f"  Downloads: {asset_data.get('download_count', 'Unknown')}\n")
+    return mcp_text_content("\n".join(lines))
+
+
+def _run_hyper3d_status(server, args):
+    result = mcp_invoke_command(server, "get_hyper3d_status")
+    return mcp_text_content(result.get("message", "") if isinstance(result, dict) else str(result))
+
+
+def _run_hyper3d_via_text(server, args):
+    result = mcp_invoke_command(
+        server,
+        "create_rodin_job",
+        {
+            "text_prompt": args.get("text_prompt"),
+            "images": None,
+            "bbox_condition": _process_bbox_condition(args.get("bbox_condition")),
+        },
+    )
+    if isinstance(result, dict) and result.get("submit_time"):
+        return mcp_json_content(
+            {"task_uuid": result["uuid"], "subscription_key": result["jobs"]["subscription_key"]}
+        )
+    return mcp_json_content(result)
+
+
+def _run_hyper3d_via_images(server, args):
+    image_paths = args.get("input_image_paths")
+    image_urls = args.get("input_image_urls")
+    if image_paths is not None and image_urls is not None:
+        return mcp_text_content("Error: Conflict parameters given!", True)
+    if image_paths is None and image_urls is None:
+        return mcp_text_content("Error: No image given!", True)
+
+    try:
+        if image_paths is not None:
+            missing = [path for path in image_paths if not os.path.exists(path)]
+            if missing:
+                return mcp_text_content(f"Error: not all image paths are valid! {missing}", True)
+            images = []
+            for path in image_paths:
+                with open(path, "rb") as handle:
+                    images.append(
+                        (Path(path).suffix, base64.b64encode(handle.read()).decode("ascii"))
+                    )
+        else:
+            images = list(image_urls)
+
+        result = mcp_invoke_command(
+            server,
+            "create_rodin_job",
+            {
+                "text_prompt": None,
+                "images": images,
+                "bbox_condition": _process_bbox_condition(args.get("bbox_condition")),
+            },
+        )
+    except Exception as exc:
+        return mcp_text_content(f"Error generating Hyper3D task: {exc}", True)
+
+    if isinstance(result, dict) and result.get("submit_time"):
+        return mcp_json_content(
+            {"task_uuid": result["uuid"], "subscription_key": result["jobs"]["subscription_key"]}
+        )
+    return mcp_json_content(result)
+
+
+def _run_poll_rodin(server, args):
+    kwargs = {}
+    if args.get("subscription_key"):
+        kwargs["subscription_key"] = args["subscription_key"]
+    elif args.get("request_id"):
+        kwargs["request_id"] = args["request_id"]
+    return mcp_json_content(mcp_invoke_command(server, "poll_rodin_job_status", kwargs))
+
+
+def _run_import_generated_asset(server, args):
+    kwargs = {"name": args.get("name")}
+    if args.get("task_uuid"):
+        kwargs["task_uuid"] = args["task_uuid"]
+    elif args.get("request_id"):
+        kwargs["request_id"] = args["request_id"]
+    return mcp_json_content(mcp_invoke_command(server, "import_generated_asset", kwargs))
+
+
+def _run_sketchfab_status(server, args):
+    result = mcp_invoke_command(server, "get_sketchfab_status")
+    message = result.get("message", "") if isinstance(result, dict) else str(result)
+    if isinstance(result, dict) and result.get("enabled"):
+        message += "Sketchfab is good at Realistic models, and has a wider variety of models than PolyHaven."
+    return mcp_text_content(message)
+
+
+def _run_search_sketchfab(server, args):
+    result = mcp_invoke_command(
+        server,
+        "search_sketchfab_models",
+        {
+            "query": args.get("query"),
+            "categories": args.get("categories"),
+            "count": args.get("count", 20),
+            "downloadable": args.get("downloadable", True),
+        },
+    )
+    models = (result or {}).get("results", []) if isinstance(result, dict) else []
+    if not models:
+        return mcp_text_content(f"No models found matching '{args.get('query')}'")
+    query = args.get("query")
+    lines = [f"Found {len(models)} models matching '{query}':", ""]
+    for model in models:
+        if not model:
+            continue
+        lines.append(f"- {model.get('name', 'Unnamed model')} (UID: {model.get('uid', 'Unknown ID')})")
+        user = model.get("user") or {}
+        lines.append(f"  Author: {user.get('username', 'Unknown author') if isinstance(user, dict) else 'Unknown author'}")
+        license_data = model.get("license") or {}
+        lines.append(f"  License: {license_data.get('label', 'Unknown') if isinstance(license_data, dict) else 'Unknown'}")
+        lines.append(f"  Face count: {model.get('faceCount', 'Unknown')}")
+        lines.append(f"  Downloadable: {'Yes' if model.get('isDownloadable') else 'No'}\n")
+    return mcp_text_content("\n".join(lines))
+
+
+def _run_sketchfab_preview(server, args):
+    result = mcp_invoke_command(server, "get_sketchfab_model_preview", {"uid": args.get("uid")})
+    if not isinstance(result, dict) or not result.get("image_data"):
+        return mcp_text_content("Error: no preview returned by Sketchfab", True)
+    image_format = str(result.get("format", "jpeg")).lower()
+    mime_type = "image/jpeg" if image_format in ("jpg", "jpeg") else f"image/{image_format}"
+    return mcp_image_content(result["image_data"], mime_type)
+
+
+def _run_download_sketchfab(server, args):
+    result = mcp_invoke_command(
+        server,
+        "download_sketchfab_model",
+        {"uid": args.get("uid"), "normalize_size": True, "target_size": args.get("target_size")},
+    )
+    if not isinstance(result, dict) or not result.get("success"):
+        message = result.get("message", "Unknown error") if isinstance(result, dict) else str(result)
+        return mcp_text_content(f"Failed to download model: {message}", True)
+    lines = ["Successfully imported model."]
+    imported = result.get("imported_objects", [])
+    lines.append(f"Created objects: {', '.join(imported) if imported else 'none'}")
+    if result.get("dimensions"):
+        dims = result["dimensions"]
+        lines.append(f"Dimensions (X, Y, Z): {dims[0]:.3f} x {dims[1]:.3f} x {dims[2]:.3f} meters")
+    if result.get("world_bounding_box"):
+        bbox = result["world_bounding_box"]
+        lines.append(f"Bounding box: min={bbox[0]}, max={bbox[1]}")
+    if result.get("normalized"):
+        lines.append(
+            f"Size normalized: scale factor {result.get('scale_applied', 1.0):.6f} applied "
+            f"(target size: {args.get('target_size')}m)"
+        )
+    return mcp_text_content("\n".join(lines))
+
+
+def _run_hunyuan3d_status(server, args):
+    result = mcp_invoke_command(server, "get_hunyuan3d_status")
+    return mcp_text_content(result.get("message", "") if isinstance(result, dict) else str(result))
+
+
+def _run_generate_hunyuan(server, args):
+    result = mcp_invoke_command(
+        server,
+        "create_hunyuan_job",
+        {"text_prompt": args.get("text_prompt"), "image": args.get("input_image_url")},
+    )
+    if isinstance(result, dict):
+        job_id = (result.get("Response") or {}).get("JobId")
+        if job_id:
+            return mcp_json_content({"job_id": f"job_{job_id}"})
+    return mcp_json_content(result)
+
+
+def _run_poll_hunyuan(server, args):
+    return mcp_json_content(
+        mcp_invoke_command(server, "poll_hunyuan_job_status", {"job_id": args.get("job_id")})
+    )
+
+
+def _run_import_hunyuan(server, args):
+    kwargs = {"name": args.get("name")}
+    if args.get("zip_file_url"):
+        kwargs["zip_file_url"] = args["zip_file_url"]
+    return mcp_json_content(mcp_invoke_command(server, "import_generated_asset_hunyuan", kwargs))
+
+
+def _build_mcp_tools():
+    tools = []
+
+    def add(name, description, input_schema, run, annotations=None):
+        tool = {"name": name, "description": description, "inputSchema": input_schema, "run": run}
+        if annotations:
+            tool["annotations"] = annotations
+        tools.append(tool)
+
+    add(
+        "get_scene_info",
+        "Get detailed information about the current Blender scene",
+        _schema_object(),
+        _run_get_scene_info,
+        _annotations(read_only=True),
+    )
+    add(
+        "get_object_info",
+        "Get detailed information about a specific object in the Blender scene.",
+        _schema_object(
+            {"object_name": _prop_string("The name of the object to get information about")},
+            ["object_name"],
+        ),
+        _run_get_object_info,
+        _annotations(read_only=True),
+    )
+    add(
+        "get_viewport_screenshot",
+        "Capture a screenshot of the current Blender 3D viewport. Returns the screenshot as an image.",
+        _schema_object({"max_size": _prop_integer("Maximum size in pixels for the largest dimension", 800)}),
+        _run_viewport_screenshot,
+        _annotations(read_only=True),
+    )
+    add(
+        "render_scene",
+        "Render the scene from the active (or named) camera and return the image. Use this to "
+        "check lighting, materials and camera framing - it works even when the viewport is not "
+        "visible. Set async=true for slow renders and poll get_task_status.",
+        _schema_object(
+            {
+                "camera": _prop_string("Optional name of the camera to render from (default: active camera)"),
+                "max_size": _prop_integer("Maximum size in pixels for the largest dimension", 800),
+                "resolution_percentage": _prop_integer("Optional render resolution percentage (1-100)"),
+                "async": _prop_boolean("Return a task_id immediately instead of waiting for the render", False),
+                "request_id": _prop_string("Optional idempotency key so a retried call is not run twice"),
+            }
+        ),
+        _run_render_scene,
+        _annotations(read_only=True),
+    )
+    add(
+        "execute_blender_code",
+        "Execute arbitrary Python code in Blender. Do it step-by-step by breaking it into smaller "
+        "chunks. For long-running code set async=true and poll get_task_status.",
+        _schema_object(
+            {
+                "code": _prop_string("The Python code to execute"),
+                "async": _prop_boolean("Run in the background and return a task_id immediately", False),
+                "request_id": _prop_string("Optional idempotency key so a retried call is not run twice"),
+            },
+            ["code"],
+        ),
+        _run_execute_code,
+        _annotations(destructive=True),
+    )
+    add(
+        "get_task_status",
+        "Check the status of a background task started with async=true. Returns the result (or an "
+        "image for render tasks) once the task has finished.",
+        _schema_object(
+            {"task_id": _prop_string("The task_id returned when the async task was started")},
+            ["task_id"],
+        ),
+        _run_task_status,
+        _annotations(read_only=True),
+    )
+    add(
+        "cancel_task",
+        "Mark a running background task as cancelled so its result is discarded.",
+        _schema_object(
+            {"task_id": _prop_string("The task_id of the task to cancel")},
+            ["task_id"],
+        ),
+        _run_cancel_task,
+        _annotations(destructive=True),
+    )
+    add(
+        "get_polyhaven_status",
+        "Check if PolyHaven integration is enabled in Blender.",
+        _schema_object(),
+        _run_polyhaven_status,
+    )
+    add(
+        "get_polyhaven_categories",
+        "Get a list of categories for a specific asset type on Polyhaven.",
+        _schema_object(
+            {"asset_type": _prop_string("The type of asset to get categories for (hdris, textures, models, all)")}
+        ),
+        _run_polyhaven_categories,
+    )
+    add(
+        "search_polyhaven_assets",
+        "Search for assets on Polyhaven with optional filtering.",
+        _schema_object(
+            {
+                "asset_type": _prop_string("Type of assets to search for (hdris, textures, models, all)"),
+                "categories": _prop_string("Optional comma-separated list of categories to filter by"),
+            }
+        ),
+        _run_search_polyhaven_assets,
+    )
+    add(
+        "download_polyhaven_asset",
+        "Download and import a Polyhaven asset into Blender.",
+        _schema_object(
+            {
+                "asset_id": _prop_string("The ID of the asset to download"),
+                "asset_type": _prop_string("The type of asset (hdris, textures, models)"),
+                "resolution": _prop_string("The resolution to download (e.g. 1k, 2k, 4k)"),
+                "file_format": _prop_string("Optional file format (hdr, exr, jpg, png, gltf, fbx, ...)"),
+            },
+            ["asset_id", "asset_type"],
+        ),
+        _tool_simple("download_polyhaven_asset"),
+    )
+    add(
+        "set_texture",
+        "Apply a previously downloaded Polyhaven texture to an object.",
+        _schema_object(
+            {
+                "object_name": _prop_string("Name of the object to apply the texture to"),
+                "texture_id": _prop_string("ID of the Polyhaven texture to apply (must be downloaded first)"),
+            },
+            ["object_name", "texture_id"],
+        ),
+        _tool_simple("set_texture"),
+    )
+    add(
+        "get_hyper3d_status",
+        "Check if Hyper3D Rodin integration is enabled in Blender.",
+        _schema_object(),
+        _run_hyper3d_status,
+    )
+    add(
+        "generate_hyper3d_model_via_text",
+        "Generate a 3D asset with Hyper3D Rodin from a text prompt and start importing it into Blender.",
+        _schema_object(
+            {
+                "text_prompt": _prop_string("A short description of the desired model, in English."),
+                "bbox_condition": _prop_array(
+                    "number", "Optional list of 3 floats controlling the [Length, Width, Height] ratio"
+                ),
+            },
+            ["text_prompt"],
+        ),
+        _run_hyper3d_via_text,
+    )
+    add(
+        "generate_hyper3d_model_via_images",
+        "Generate a 3D asset with Hyper3D Rodin from reference images. "
+        "Only one of input_image_paths / input_image_urls may be given.",
+        _schema_object(
+            {
+                "input_image_paths": _prop_array("string", "Absolute paths of the input images"),
+                "input_image_urls": _prop_array("string", "URLs of the input images (FAL_AI mode)"),
+                "bbox_condition": _prop_array(
+                    "number", "Optional list of 3 floats controlling the [Length, Width, Height] ratio"
+                ),
+            }
+        ),
+        _run_hyper3d_via_images,
+    )
+    add(
+        "poll_rodin_job_status",
+        "Check whether a Hyper3D Rodin generation task has completed. Give subscription_key for "
+        "MAIN_SITE mode, or request_id for FAL_AI mode.",
+        _schema_object(
+            {
+                "subscription_key": _prop_string("The subscription_key returned when the task was created"),
+                "request_id": _prop_string("The request_id returned when the task was created (FAL_AI)"),
+            }
+        ),
+        _run_poll_rodin,
+    )
+    add(
+        "import_generated_asset",
+        "Import an asset generated by Hyper3D Rodin once the task has completed.",
+        _schema_object(
+            {
+                "name": _prop_string("The name of the object in the scene"),
+                "task_uuid": _prop_string("task_uuid from the generation step (MAIN_SITE)"),
+                "request_id": _prop_string("request_id from the generation step (FAL_AI)"),
+            },
+            ["name"],
+        ),
+        _run_import_generated_asset,
+    )
+    add(
+        "get_sketchfab_status",
+        "Check if Sketchfab integration is enabled in Blender.",
+        _schema_object(),
+        _run_sketchfab_status,
+    )
+    add(
+        "search_sketchfab_models",
+        "Search for downloadable models on Sketchfab.",
+        _schema_object(
+            {
+                "query": _prop_string("Text to search for"),
+                "categories": _prop_string("Optional comma-separated list of categories"),
+                "count": _prop_integer("Maximum number of results to return", 20),
+                "downloadable": _prop_boolean("Only include downloadable models", True),
+            },
+            ["query"],
+        ),
+        _run_search_sketchfab,
+    )
+    add(
+        "get_sketchfab_model_preview",
+        "Get a preview thumbnail of a Sketchfab model by its UID. Returns the thumbnail as an image.",
+        _schema_object({"uid": _prop_string("The unique identifier of the Sketchfab model")}, ["uid"]),
+        _run_sketchfab_preview,
+    )
+    add(
+        "download_sketchfab_model",
+        "Download and import a Sketchfab model by its UID, scaled so its largest dimension "
+        "equals target_size.",
+        _schema_object(
+            {
+                "uid": _prop_string("The unique identifier of the Sketchfab model"),
+                "target_size": _prop_number(
+                    "REQUIRED. Target size in Blender units for the largest dimension"
+                ),
+            },
+            ["uid", "target_size"],
+        ),
+        _run_download_sketchfab,
+    )
+    add(
+        "get_hunyuan3d_status",
+        "Check if Hunyuan3D integration is enabled in Blender.",
+        _schema_object(),
+        _run_hunyuan3d_status,
+    )
+    add(
+        "generate_hunyuan3d_model",
+        "Generate a 3D asset with Hunyuan3D from a text prompt and/or an image, and import it into Blender.",
+        _schema_object(
+            {
+                "text_prompt": _prop_string("Optional short description (English or Chinese)"),
+                "input_image_url": _prop_string("Optional local or remote URL of the input image"),
+            }
+        ),
+        _run_generate_hunyuan,
+    )
+    add(
+        "poll_hunyuan_job_status",
+        "Check whether a Hunyuan3D generation task has completed.",
+        _schema_object({"job_id": _prop_string("The job_id returned when the task was created")}),
+        _run_poll_hunyuan,
+    )
+    add(
+        "import_generated_asset_hunyuan",
+        "Import an asset generated by Hunyuan3D once the task has completed.",
+        _schema_object(
+            {
+                "name": _prop_string("The name of the object in the scene"),
+                "zip_file_url": _prop_string("zip_file_url returned by the generation step"),
+            },
+            ["name"],
+        ),
+        _run_import_hunyuan,
+    )
+
+    return tools
+
+
+MCP_TOOLS = _build_mcp_tools()
+MCP_TOOLS_BY_NAME = {tool["name"]: tool for tool in MCP_TOOLS}
+
+
+# ---------------------------------------------------------------------------
+# MCP application (protocol methods)
+# ---------------------------------------------------------------------------
+
+class BlenderMCPApplication:
+    """Implements the MCP methods on top of Blender's command table."""
+
+    def __init__(self, command_server=None):
+        self.command_server = command_server
+        self.sessions = set()
+
+    def set_command_server(self, command_server):
+        self.command_server = command_server
+
+    def initialize(self, params):
+        requested = (params or {}).get("protocolVersion")
+        if requested in MCP_SUPPORTED_PROTOCOL_VERSIONS:
+            protocol_version = requested
+        else:
+            protocol_version = MCP_DEFAULT_PROTOCOL_VERSION
+        return {
+            "protocolVersion": protocol_version,
+            "capabilities": {
+                "tools": {"listChanged": False},
+                "prompts": {"listChanged": False},
+                "resources": {"subscribe": False, "listChanged": False},
+                "logging": {},
+            },
+            "serverInfo": {"name": MCP_SERVER_NAME, "version": MCP_SERVER_VERSION},
+            "instructions": MCP_INSTRUCTIONS,
+        }
+
+    def list_tools(self):
+        tools = []
+        for tool in MCP_TOOLS:
+            entry = {
+                "name": tool["name"],
+                "description": tool["description"],
+                "inputSchema": tool["inputSchema"],
+            }
+            if tool.get("annotations"):
+                entry["annotations"] = tool["annotations"]
+            tools.append(entry)
+        return tools
+
+    def call_tool(self, params):
+        name = (params or {}).get("name")
+        arguments = (params or {}).get("arguments") or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        tool = MCP_TOOLS_BY_NAME.get(name)
+        if tool is None:
+            return mcp_text_content(f"Unknown tool: {name}", True)
+
+        command_server = self.command_server
+        if command_server is None:
+            return mcp_text_content(
+                "BlenderMCP is not ready - the add-on command host is missing. "
+                "Re-enable the Blender MCP add-on and retry.",
+                True,
+            )
+
+        try:
+            content = run_on_blender_main_thread(lambda: tool["run"](command_server, arguments))
+        except (MCPToolError, TimeoutError, ValueError) as exc:
+            # Expected / actionable failures - keep the console readable.
+            print(f"[BlenderMCP] Tool '{name}' failed: {exc}")
+            return mcp_text_content(f"{type(exc).__name__}: {exc}", True)
+        except BaseException as exc:  # noqa: BLE001 - reported to the client
+            print(f"[BlenderMCP] Tool '{name}' failed unexpectedly: {exc}")
+            traceback.print_exc()
+            return mcp_text_content(f"{type(exc).__name__}: {exc}", True)
+
+        if not isinstance(content, dict) or "content" not in content:
+            return mcp_json_content(content)
+        return content
+
+    def list_prompts(self):
+        return [
+            {
+                "name": "asset_creation_strategy",
+                "description": "Defines the preferred strategy for creating assets in Blender",
+                "arguments": [],
+            }
+        ]
+
+    def get_prompt(self, params):
+        name = (params or {}).get("name")
+        if name != "asset_creation_strategy":
+            raise MCPMethodNotFound(f"prompts/get {name}")
+        return {
+            "description": "Defines the preferred strategy for creating assets in Blender",
+            "messages": [
+                {"role": "user", "content": {"type": "text", "text": MCP_ASSET_CREATION_STRATEGY}}
+            ],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Streamable HTTP transport
+# ---------------------------------------------------------------------------
+
+class _MCPRequestHandler(BaseHTTPRequestHandler):
+    """Minimal, dependency-free implementation of the MCP HTTP transport."""
+
+    protocol_version = "HTTP/1.1"
+    server_version = "BlenderMCP/" + MCP_SERVER_VERSION
+    sys_version = ""
+
+    # -- logging -----------------------------------------------------------
+    def log_message(self, fmt, *args):
+        if MCP_VERBOSE_LOG:
+            print("[BlenderMCP][http] " + (fmt % args))
+
+    def log_error(self, fmt, *args):
+        print("[BlenderMCP][http] " + (fmt % args))
+
+    # -- helpers -----------------------------------------------------------
+    def _endpoint_path(self):
+        path = urlparse(self.path).path or "/"
+        if len(path) > 1:
+            path = path.rstrip("/") or "/"
+        return path
+
+    def _is_endpoint(self):
+        return self._endpoint_path() in ("/", MCP_HTTP_PATH)
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Accept, Authorization, Mcp-Session-Id, MCP-Protocol-Version",
+        )
+        self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
+
+    def _respond(self, status, body=b"", content_type="application/json", session_id=None):
+        self.send_response(status)
+        if body:
+            self.send_header("Content-Type", content_type)
+        if status not in (204, 304):
+            self.send_header("Content-Length", str(len(body)))
+        if session_id:
+            self.send_header("Mcp-Session-Id", session_id)
+        self._cors()
+        self.end_headers()
+        if body:
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def _respond_json(self, payload, status=200, session_id=None):
+        body = json.dumps(payload, default=str).encode("utf-8")
+        self._respond(status, body, "application/json", session_id)
+
+    @staticmethod
+    def _rpc_error(msg_id, code, message):
+        return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
+
+    # -- HTTP verbs --------------------------------------------------------
+    def do_OPTIONS(self):
+        self._respond(204)
+
+    def do_GET(self):
+        if not self._is_endpoint():
+            self._respond_json({"error": "not found"}, 404)
+            return
+        # The POST (JSON) flavour of Streamable HTTP is enough for Blender; the
+        # spec allows answering 405 when no SSE stream is offered.
+        self.send_response(405)
+        self.send_header("Allow", "POST, DELETE, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self._cors()
+        self.end_headers()
+
+    def do_DELETE(self):
+        session_id = self.headers.get("Mcp-Session-Id")
+        application = getattr(self.server, "mcp_application", None)
+        if session_id and application is not None:
+            application.sessions.discard(session_id)
+        self._respond(204)
+
+    def do_POST(self):
+        if not self._is_endpoint():
+            self._respond_json(self._rpc_error(None, -32600, "Invalid endpoint"), 404)
+            return
+
+        self._session_id = self.headers.get("Mcp-Session-Id") or None
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+
+        try:
+            message = json.loads(raw.decode("utf-8")) if raw.strip() else None
+        except (UnicodeDecodeError, ValueError) as exc:
+            self._respond_json(self._rpc_error(None, -32700, f"Parse error: {exc}"), 400)
+            return
+
+        if message is None:
+            self._respond_json(self._rpc_error(None, -32600, "Invalid Request"), 400)
+            return
+
+        if isinstance(message, list):
+            responses = []
+            for item in message:
+                payload = self._rpc_response(item)
+                if payload is not None:
+                    responses.append(payload)
+            if not responses:
+                self._respond(202)
+                return
+            self._respond_json(responses, 200, self._session_id)
+            return
+
+        payload = self._rpc_response(message)
+        if payload is None:
+            self._respond(202)
+            return
+        self._respond_json(payload, 200, self._session_id)
+
+    # -- JSON-RPC ----------------------------------------------------------
+    def _rpc_response(self, message):
+        """Return the JSON-RPC response, or ``None`` for notifications."""
+        if not isinstance(message, dict):
+            return self._rpc_error(None, -32600, "Invalid Request")
+
+        msg_id = message.get("id")
+        has_id = "id" in message and msg_id is not None
+        if not has_id:
+            # Notification (or a reply to a server-initiated request): nothing to send back.
+            return None
+
+        method = message.get("method")
+        if not isinstance(method, str):
+            return self._rpc_error(msg_id, -32600, "Invalid Request")
+
+        params = message.get("params")
+        if params is not None and not isinstance(params, dict):
+            return self._rpc_error(msg_id, -32602, "Invalid params")
+
+        try:
+            result = self._call_method(method, params or {})
+        except MCPMethodNotFound as exc:
+            return self._rpc_error(msg_id, -32601, f"Method not found: {exc.method}")
+        except BaseException as exc:  # noqa: BLE001 - reported to the client
+            print(f"[BlenderMCP] '{method}' failed: {exc}")
+            traceback.print_exc()
+            return self._rpc_error(msg_id, -32603, f"{type(exc).__name__}: {exc}")
+
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _call_method(self, method, params):
+        application = getattr(self.server, "mcp_application", None)
+        if application is None:
+            raise MCPToolError("The MCP endpoint has no application attached")
+
+        if method == "initialize":
+            self._session_id = uuid.uuid4().hex
+            application.sessions.add(self._session_id)
+            return application.initialize(params)
+
+        if method.startswith("notifications/"):
+            return {}
+
+        if method == "ping":
+            return {}
+
+        if method == "tools/list":
+            return {"tools": application.list_tools()}
+
+        if method == "tools/call":
+            return application.call_tool(params)
+
+        if method == "prompts/list":
+            return {"prompts": application.list_prompts()}
+
+        if method == "prompts/get":
+            return application.get_prompt(params)
+
+        if method == "resources/list":
+            return {"resources": []}
+
+        if method == "resources/templates/list":
+            return {"resourceTemplates": []}
+
+        if method == "logging/setLevel":
+            return {}
+
+        if method == "completion/complete":
+            return {"completion": {"values": [], "total": 0, "hasMore": False}}
+
+        raise MCPMethodNotFound(method)
+
+
+class BlenderMCPHttpServer:
+    """Hosts the embedded MCP endpoint inside Blender."""
+
+    def __init__(
+        self,
+        host=MCP_DEFAULT_HOST,
+        port=MCP_DEFAULT_MCP_PORT,
+        path=MCP_HTTP_PATH,
+        command_server=None,
+    ):
+        self.host = host
+        self.port = port
+        self.path = path
+        self.application = BlenderMCPApplication(command_server)
+        self.running = False
+        self.last_error = None
+        self._httpd = None
+        self._thread = None
+
+    @property
+    def url(self):
+        display_host = self.host
+        if display_host in ("0.0.0.0", "::", "", None):
+            display_host = "127.0.0.1"
+        return f"http://{display_host}:{self.port}{self.path}"
+
+    def set_command_server(self, command_server):
+        self.application.set_command_server(command_server)
+
+    def start(self):
+        if self.running:
+            return True
+        try:
+            httpd = ThreadingHTTPServer((self.host, self.port), _MCPRequestHandler)
+        except Exception as exc:
+            self.last_error = str(exc)
+            print(
+                f"[BlenderMCP] Could not start the MCP endpoint on {self.host}:{self.port} - {exc}"
+            )
+            return False
+
+        httpd.daemon_threads = True
+        httpd.allow_reuse_address = True
+        httpd.mcp_application = self.application
+        httpd.mcp_http_server = self
+
+        # Resolve the port we actually bound (relevant when port 0 was requested).
+        self.port = httpd.server_address[1]
+
+        self._httpd = httpd
+        self._thread = threading.Thread(target=self._serve, name="BlenderMCP-MCP", daemon=True)
+        self._thread.start()
+        self.running = True
+        self.last_error = None
+        print(f"[BlenderMCP] MCP endpoint listening on {self.url}")
+        return True
+
+    def _serve(self):
+        try:
+            self._httpd.serve_forever(poll_interval=0.2)
+        except Exception as exc:
+            print(f"[BlenderMCP] MCP endpoint stopped unexpectedly: {exc}")
+        finally:
+            self.running = False
+
+    def stop(self):
+        httpd, self._httpd = self._httpd, None
+        self.running = False
+        if httpd is not None:
+            try:
+                httpd.shutdown()
+            except Exception:
+                pass
+            try:
+                httpd.server_close()
+            except Exception:
+                pass
+        self._thread = None
+        print("[BlenderMCP] MCP endpoint stopped")
+
+
+# ---------------------------------------------------------------------------
+# Server lifecycle helpers (auto-start, preferences, status)
+# ---------------------------------------------------------------------------
+
+def get_addon_preferences():
+    """Return this add-on's preferences, whatever module name it was loaded as."""
+    try:
+        addons = bpy.context.preferences.addons
+    except Exception:
+        return None
+
+    for key in (__name__, __package__, "addon", "blender_mcp"):
+        if not key:
+            continue
+        try:
+            entry = addons.get(key)
+        except Exception:
+            entry = None
+        preferences = getattr(entry, "preferences", None) if entry else None
+        if preferences is not None and hasattr(preferences, "auto_start"):
+            return preferences
+
+    try:
+        for entry in addons:
+            preferences = getattr(entry, "preferences", None)
+            if preferences is not None and hasattr(preferences, "auto_start"):
+                return preferences
+    except Exception:
+        pass
+    return None
+
+
+def _pref_value(preferences, name, default):
+    if preferences is None:
+        return default
+    try:
+        value = getattr(preferences, name)
+    except Exception:
+        return default
+    return default if value is None else value
+
+
+def get_socket_server():
+    return getattr(bpy.types, "blendermcp_server", None)
+
+
+def get_http_server():
+    return getattr(bpy.types, "blendermcp_http_server", None)
+
+
+def is_blendermcp_running():
+    """Return ``(socket_running, mcp_running)``."""
+    socket_server = get_socket_server()
+    http_server = get_http_server()
+    return (
+        bool(socket_server is not None and socket_server.running),
+        bool(http_server is not None and http_server.running),
+    )
+
+
+def get_mcp_endpoint_url():
+    http_server = get_http_server()
+    if http_server is not None:
+        return http_server.url
+    preferences = get_addon_preferences()
+    host = str(_pref_value(preferences, "server_host", MCP_DEFAULT_HOST) or MCP_DEFAULT_HOST)
+    if host in ("0.0.0.0", "::", ""):
+        host = "127.0.0.1"
+    port = int(_pref_value(preferences, "mcp_port", MCP_DEFAULT_MCP_PORT))
+    return f"http://{host}:{port}{MCP_HTTP_PATH}"
+
+
+def _sync_scene_status():
+    """Keep the legacy ``scene.blendermcp_server_running`` flag up to date."""
+    socket_running, mcp_running = is_blendermcp_running()
+    for scene in getattr(bpy.data, "scenes", []) or []:
+        try:
+            scene.blendermcp_server_running = mcp_running or socket_running
+        except Exception:
+            pass
+    return socket_running, mcp_running
+
+
+def start_blendermcp_servers():
+    """Start (or re-sync) the legacy socket server and the MCP endpoint.
+
+    Returns ``True`` when the MCP endpoint is listening.  Safe to call
+    repeatedly - it only restarts what actually changed.
+    """
+    preferences = get_addon_preferences()
+    host = str(_pref_value(preferences, "server_host", MCP_DEFAULT_HOST) or MCP_DEFAULT_HOST)
+    socket_port = int(_pref_value(preferences, "socket_port", MCP_DEFAULT_SOCKET_PORT))
+    mcp_port = int(_pref_value(preferences, "mcp_port", MCP_DEFAULT_MCP_PORT))
+    enable_socket = bool(_pref_value(preferences, "enable_socket_server", True))
+
+    # --- command host (always alive while the add-on is enabled) -----------
+    command_host = get_socket_server()
+    if command_host is None:
+        command_host = BlenderMCPServer(host=host, port=socket_port)
+        bpy.types.blendermcp_server = command_host
+
+    # --- legacy raw socket server -----------------------------------------
+    if enable_socket:
+        if command_host.running and (command_host.host != host or command_host.port != socket_port):
+            command_host.stop()
+        if not command_host.running:
+            command_host.host = host
+            command_host.port = socket_port
+            command_host.start()
+    elif command_host.running:
+        command_host.stop()
+
+    # --- embedded MCP endpoint --------------------------------------------
+    http_server = get_http_server()
+    if http_server is None:
+        http_server = BlenderMCPHttpServer(host=host, port=mcp_port)
+        bpy.types.blendermcp_http_server = http_server
+    http_server.set_command_server(command_host)
+
+    if http_server.running and (http_server.host != host or http_server.port != mcp_port):
+        http_server.stop()
+    if not http_server.running:
+        http_server.host = host
+        http_server.port = mcp_port
+        http_server.start()
+
+    _sync_scene_status()
+    return http_server.running
+
+
+def stop_blendermcp_servers():
+    """Stop both servers and drop the instances."""
+    http_server = get_http_server()
+    if http_server is not None:
+        http_server.stop()
+        try:
+            del bpy.types.blendermcp_http_server
+        except AttributeError:
+            pass
+
+    socket_server = get_socket_server()
+    if socket_server is not None:
+        socket_server.stop()
+        try:
+            del bpy.types.blendermcp_server
+        except AttributeError:
+            pass
+
+    _sync_scene_status()
+
+
+def _blendermcp_autostart():
+    """One-shot timer callback: bring the servers up without any user action."""
+    try:
+        preferences = get_addon_preferences()
+        if preferences is not None and not bool(_pref_value(preferences, "auto_start", True)):
+            print("[BlenderMCP] Automatic start is disabled in the add-on preferences.")
+            return None
+        ok = start_blendermcp_servers()
+        print(f"[BlenderMCP] Automatic start {'succeeded' if ok else 'FAILED'}")
+    except Exception:
+        traceback.print_exc()
+    return None
+
+
+def _blendermcp_ensure_running():
+    """Timer callback: restart the servers if they stopped unexpectedly.
+
+    Loading a new file, ``read_factory_settings`` or a crash in a worker
+    thread can leave the endpoints down while the add-on is still enabled.
+    This watcher brings them back so the MCP client does not silently lose
+    the connection.
+    """
+    try:
+        preferences = get_addon_preferences()
+        if preferences is not None and not bool(_pref_value(preferences, "auto_start", True)):
+            return 5.0
+        http_server = get_http_server()
+        socket_server = get_socket_server()
+        http_down = http_server is None or not http_server.running
+        socket_down = socket_server is None or not socket_server.running
+        if http_down or socket_down:
+            print("[BlenderMCP] Endpoint(s) went down - restarting automatically")
+            start_blendermcp_servers()
+    except Exception:
+        traceback.print_exc()
+    return 5.0  # keep watching
+
+
+def _blendermcp_on_load(*_args, **_kwargs):
+    """``load_post`` handler: make sure the endpoints survive a file load."""
+    try:
+        preferences = get_addon_preferences()
+        if preferences is not None and not bool(_pref_value(preferences, "auto_start", True)):
+            return
+        http_server = get_http_server()
+        if http_server is None or not http_server.running:
+            start_blendermcp_servers()
+    except Exception:
+        traceback.print_exc()
+
 
 # Blender Addon Preferences
 class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
@@ -5791,9 +7667,78 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         default="standard",
     )
 
+    # --- embedded MCP server ------------------------------------------------
+    auto_start: BoolProperty(
+        name="Start the MCP server with Blender",
+        description="Start the embedded MCP endpoint (and the legacy socket server) "
+                    "automatically whenever Blender is launched",
+        default=True
+    )
+
+    server_host: bpy.props.StringProperty(
+        name="Host",
+        description="Interface the servers bind to. Use localhost for local clients, "
+                    "or 0.0.0.0 to allow connections from the network",
+        default=MCP_DEFAULT_HOST
+    )
+
+    mcp_port: IntProperty(
+        name="MCP Port",
+        description="Port of the embedded MCP (Streamable HTTP) endpoint",
+        default=MCP_DEFAULT_MCP_PORT,
+        min=1024,
+        max=65535
+    )
+
+    socket_port: IntProperty(
+        name="Socket Port",
+        description="Port of the legacy raw JSON socket server (used by the uvx blender-mcp "
+                    "stdio bridge and by external scripts)",
+        default=MCP_DEFAULT_SOCKET_PORT,
+        min=1024,
+        max=65535
+    )
+
+    enable_socket_server: BoolProperty(
+        name="Also run the legacy socket server",
+        description="Keep the raw JSON socket server running. Turn this off if you only use "
+                    "the MCP endpoint",
+        default=True
+    )
+
     def draw(self, context):
         layout = self.layout
-        
+
+        # Embedded MCP server section
+        layout.label(text="MCP server:", icon='PLUGIN')
+
+        box = layout.box()
+        box.prop(self, "auto_start")
+        column = box.column(align=True)
+        column.prop(self, "server_host", text="Host")
+        column.prop(self, "mcp_port", text="MCP port")
+        box.prop(self, "enable_socket_server")
+        if self.enable_socket_server:
+            box.prop(self, "socket_port", text="Socket port")
+
+        socket_running, mcp_running = is_blendermcp_running()
+        row = box.row(align=True)
+        row.operator("blendermcp.start_server", text="Start", icon='PLAY')
+        row.operator("blendermcp.stop_server", text="Stop", icon='PAUSE')
+
+        if mcp_running:
+            box.label(text=f"Running on {get_mcp_endpoint_url()}", icon='CHECKMARK')
+        else:
+            http_server = get_http_server()
+            box.label(text="MCP endpoint is not running", icon='ERROR')
+            if http_server is not None and http_server.last_error:
+                box.label(text=http_server.last_error)
+        if self.enable_socket_server:
+            if socket_running:
+                box.label(text=f"Socket server on port {self.socket_port}", icon='CHECKMARK')
+            else:
+                box.label(text="Socket server is not running", icon='ERROR')
+
         # Telemetry section
         layout.label(text="Telemetry & Privacy:", icon='PREFERENCES')
         
@@ -5804,13 +7749,11 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         # Info text
         box.separator()
         if self.telemetry_consent:
-            box.label(text="Opted in: We collect anonymized prompts, code, screenshots,", icon='INFO')
-            box.label(text="and trajectory data (actions, scene state, feedback).", icon='BLANK1')
+            box.label(text="Consent recorded. This build does not upload anything.", icon='INFO')
         else:
-            box.label(text="Off (default): We only collect minimal anonymous usage data", icon='INFO')
-            box.label(text="(tool names, success/failure, duration - no prompts or code).", icon='BLANK1')
+            box.label(text="Telemetry consent declined.", icon='INFO')
         box.separator()
-        box.label(text="Data is not linked to your name or account. Change this anytime.", icon='CHECKMARK')
+        box.label(text="You can change this anytime.", icon='CHECKMARK')
         
         # Terms and Conditions link
         box.separator()
@@ -5980,6 +7923,48 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
 
         layout.separator()
         draw_addon_update(layout)
+        # --- embedded MCP server -------------------------------------------
+        socket_running, mcp_running = is_blendermcp_running()
+        box = layout.box()
+        row = box.row()
+        row.label(text="MCP server", icon='PLUGIN')
+        row = box.row(align=True)
+        row.operator("blendermcp.start_server", text="Start", icon='PLAY')
+        row.operator("blendermcp.stop_server", text="Stop", icon='PAUSE')
+        if mcp_running:
+            box.label(text="Online", icon='CHECKMARK')
+            box.label(text=get_mcp_endpoint_url())
+        else:
+            box.label(text="Offline - press Start", icon='ERROR')
+        if socket_running:
+            box.label(text="Legacy socket server online", icon='CHECKMARK')
+        box.operator("blendermcp.copy_mcp_config", text="Copy MCP client config", icon='COPYDOWN')
+
+        # --- integrations ---------------------------------------------------
+        layout.prop(scene, "blendermcp_use_polyhaven", text="Use assets from Poly Haven")
+
+        layout.prop(scene, "blendermcp_use_hyper3d", text="Use Hyper3D Rodin 3D model generation")
+        if scene.blendermcp_use_hyper3d:
+            layout.prop(scene, "blendermcp_hyper3d_mode", text="Rodin Mode")
+            layout.prop(scene, "blendermcp_hyper3d_api_key", text="API Key")
+            layout.operator("blendermcp.set_hyper3d_free_trial_api_key", text="Set Free Trial API Key")
+
+        layout.prop(scene, "blendermcp_use_sketchfab", text="Use assets from Sketchfab")
+        if scene.blendermcp_use_sketchfab:
+            layout.prop(scene, "blendermcp_sketchfab_api_key", text="API Key")
+
+        layout.prop(scene, "blendermcp_use_hunyuan3d", text="Use Tencent Hunyuan 3D model generation")
+        if scene.blendermcp_use_hunyuan3d:
+            layout.prop(scene, "blendermcp_hunyuan3d_mode", text="Hunyuan3D Mode")
+            if scene.blendermcp_hunyuan3d_mode == 'OFFICIAL_API':
+                layout.prop(scene, "blendermcp_hunyuan3d_secret_id", text="SecretId")
+                layout.prop(scene, "blendermcp_hunyuan3d_secret_key", text="SecretKey")
+            if scene.blendermcp_hunyuan3d_mode == 'LOCAL_API':
+                layout.prop(scene, "blendermcp_hunyuan3d_api_url", text="API URL")
+                layout.prop(scene, "blendermcp_hunyuan3d_octree_resolution", text="Octree Resolution")
+                layout.prop(scene, "blendermcp_hunyuan3d_num_inference_steps", text="Number of Inference Steps")
+                layout.prop(scene, "blendermcp_hunyuan3d_guidance_scale", text="Guidance Scale")
+                layout.prop(scene, "blendermcp_hunyuan3d_texture", text="Generate Texture")
 
 # Operator to set Hyper3D API Key
 class BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey(bpy.types.Operator):
@@ -6020,26 +8005,61 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
         bpy.types.blendermcp_server.start()
         scene.blendermcp_server_running = bpy.types.blendermcp_server.running
 
+    bl_label = "Start the BlenderMCP servers"
+    bl_description = "Start the embedded MCP endpoint (and the legacy socket server)"
+
+    def execute(self, context):
+        if start_blendermcp_servers():
+            self.report({'INFO'}, f"BlenderMCP MCP endpoint running at {get_mcp_endpoint_url()}")
+        else:
+            self.report({'ERROR'}, "Could not start the MCP endpoint - check the Blender console")
         return {'FINISHED'}
 
 # Operator to stop the server
 class BLENDERMCP_OT_StopServer(bpy.types.Operator):
     bl_idname = "blendermcp.stop_server"
-    bl_label = "Stop the connection to Claude"
-    bl_description = "Stop the connection to Claude"
+    bl_label = "Stop the BlenderMCP servers"
+    bl_description = "Stop the MCP endpoint and the legacy socket server"
 
     def execute(self, context):
         global _user_stopped_server
         _user_stopped_server = True
         scene = context.scene
+        stop_blendermcp_servers()
+        self.report({'INFO'}, "BlenderMCP servers stopped")
+        return {'FINISHED'}
 
-        # Stop the server if it exists
-        if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
-            bpy.types.blendermcp_server.stop()
-            del bpy.types.blendermcp_server
+# Operator to copy a ready-to-paste MCP client configuration
+class BLENDERMCP_OT_CopyMCPConfig(bpy.types.Operator):
+    bl_idname = "blendermcp.copy_mcp_config"
+    bl_label = "Copy MCP client config"
+    bl_description = "Copy a ready-to-paste MCP client configuration snippet to the clipboard"
 
-        scene.blendermcp_server_running = False
+    def execute(self, context):
+        url = get_mcp_endpoint_url()
 
+        # VS Code (.vscode/mcp.json) uses "servers" ...
+        vscode_config = {"servers": {"blendermcp": {"type": "http", "url": url}}}
+        # ... while Claude Desktop / Cursor / Claude Code use "mcpServers".
+        claude_config = {"mcpServers": {"blendermcp": {"type": "http", "url": url}}}
+
+        snippet = (
+            "# VS Code  ->  .vscode/mcp.json\n"
+            + json.dumps(vscode_config, indent=2)
+            + "\n\n# Claude Desktop / Cursor  ->  claude_desktop_config.json\n"
+            + json.dumps(claude_config, indent=2)
+            + "\n\n# Claude Code  ->  claude mcp add --transport http blendermcp "
+            + url
+            + "\n"
+        )
+
+        try:
+            context.window_manager.clipboard = snippet
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not write to the clipboard: {exc}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"MCP client config copied ({url})")
         return {'FINISHED'}
 
 #region Addon updates
@@ -6213,14 +8233,17 @@ class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
 
 # Registration functions
 def register():
+    # Deprecated: the port now comes from the add-on preferences. Kept on the
+    # scene so that existing scripts referencing it do not break.
     bpy.types.Scene.blendermcp_port = IntProperty(
         name="Port",
-        description="Port for the MCP for Blender server",
-        default=9876,
+        description="Deprecated - use the Blender MCP add-on preferences instead",
+        default=MCP_DEFAULT_SOCKET_PORT,
         min=1024,
         max=65535
     )
 
+    # Read-only status flag, kept in sync by _sync_scene_status().
     bpy.types.Scene.blendermcp_server_running = bpy.props.BoolProperty(
         name="Server Running",
         default=False
@@ -6373,6 +8396,7 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
+    bpy.utils.register_class(BLENDERMCP_OT_CopyMCPConfig)
     bpy.utils.register_class(BLENDERMCP_OT_OpenTerms)
     bpy.utils.register_class(BLENDERMCP_OT_CheckAddonUpdate)
     bpy.utils.register_class(BLENDERMCP_OT_UpdateAddon)
@@ -6386,6 +8410,35 @@ def register():
     # Defer socket startup and retry after startup-file or .blend loads.
     _blendermcp_register_auto_start()
 
+    # Watch for renders / modal operators so MCP requests can fail fast
+    # instead of hanging while Blender cannot service timers.
+    _register_mcp_busy_handlers()
+
+    # Bring the embedded MCP server up without requiring a single click. A timer
+    # is used because the scene / preferences are not guaranteed to be ready
+    # while the add-on is still being registered.
+    try:
+        if bpy.app.timers.is_registered(_blendermcp_autostart):
+            bpy.app.timers.unregister(_blendermcp_autostart)
+    except Exception:
+        pass
+    try:
+        bpy.app.timers.register(_blendermcp_autostart, first_interval=1.5)
+    except Exception as e:
+        print(f"BlenderMCP: could not schedule the automatic start: {e}")
+
+    # Keep the endpoints alive across file loads and unexpected stops.
+    try:
+        if _blendermcp_on_load not in bpy.app.handlers.load_post:
+            bpy.app.handlers.load_post.append(_blendermcp_on_load)
+    except Exception as e:
+        print(f"BlenderMCP: could not register the load handler: {e}")
+    try:
+        if not bpy.app.timers.is_registered(_blendermcp_ensure_running):
+            bpy.app.timers.register(_blendermcp_ensure_running, first_interval=5.0, persistent=True)
+    except Exception as e:
+        print(f"BlenderMCP: could not start the endpoint watcher: {e}")
+
     print("BlenderMCP addon registered")
 
 def unregister():
@@ -6397,11 +8450,33 @@ def unregister():
     if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
         bpy.types.blendermcp_server.stop()
         del bpy.types.blendermcp_server
+    # Stop the servers if they are running
+    try:
+        if bpy.app.timers.is_registered(_blendermcp_autostart):
+            bpy.app.timers.unregister(_blendermcp_autostart)
+    except Exception:
+        pass
+
+    try:
+        if bpy.app.timers.is_registered(_blendermcp_ensure_running):
+            bpy.app.timers.unregister(_blendermcp_ensure_running)
+    except Exception:
+        pass
+    try:
+        if _blendermcp_on_load in bpy.app.handlers.load_post:
+            bpy.app.handlers.load_post.remove(_blendermcp_on_load)
+    except Exception:
+        pass
+
+    stop_blendermcp_servers()
+
+    _unregister_mcp_busy_handlers()
 
     bpy.utils.unregister_class(BLENDERMCP_PT_Panel)
     bpy.utils.unregister_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
+    bpy.utils.unregister_class(BLENDERMCP_OT_CopyMCPConfig)
     bpy.utils.unregister_class(BLENDERMCP_OT_OpenTerms)
     bpy.utils.unregister_class(BLENDERMCP_OT_CheckAddonUpdate)
     bpy.utils.unregister_class(BLENDERMCP_OT_UpdateAddon)

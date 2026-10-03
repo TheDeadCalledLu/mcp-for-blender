@@ -33,3 +33,9 @@ supabase/.temp/
 *.pem
 *.key
 .secrets/
+
+# Local editor / scratch files
+.vscode/
+ldraw-2902-analysis/
+_scan_*.py
+_desensitize_*.py
